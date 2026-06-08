@@ -28,6 +28,10 @@ const int I2C_SCL_GPIO = 17;
 #define PIN_INSTR_PWM 12
 #define PIN_INSTR_UART 13
 
+#define BTN_ROT_R_PIN 4 // gira direita -> seta cima
+#define BTN_ROT_L_PIN 5 // gira esquerda -> Z
+#define BTN_DEBOUNCE_US 50000
+
 #define CORE_0 (1 << 0)
 #define CORE_1 (1 << 1)
 
@@ -36,6 +40,8 @@ const int I2C_SCL_GPIO = 17;
 #define AXIS_X 0
 #define AXIS_Y 1
 #define AXIS_CLICK 2
+#define AXIS_ROT_R 3
+#define AXIS_ROT_L 4
 #define MAX_ABS_VALUE 94
 
 typedef struct
@@ -56,7 +62,9 @@ typedef struct
 QueueHandle_t xQueueMPU;
 QueueHandle_t xQueuePos;
 QueueHandle_t xQueueColor;
+QueueHandle_t xQueueBtn;
 SemaphoreHandle_t xSemaphoreBtn;
+SemaphoreHandle_t xMutexUart;
 
 static void pwm_init_pin(uint pin)
 {
@@ -114,8 +122,12 @@ static void send_packet(uint8_t axis, int8_t value)
     if (encoded == SYNC_BYTE)
         encoded = SYNC_BYTE - 1;
     uint8_t pkt[3] = {SYNC_BYTE, axis, encoded};
+    // Serializa a UART: uart_task (X/Y/click) e button_task (rotacao)
+    // escrevem na mesma serial; sem o mutex os 3 bytes poderiam intercalar.
+    xSemaphoreTake(xMutexUart, portMAX_DELAY);
     for (int i = 0; i < 3; i++)
         putchar_raw(pkt[i]);
+    xSemaphoreGive(xMutexUart);
 }
 
 void mpu6050_task(void *p)
@@ -294,6 +306,62 @@ void pwm_task(void *p)
 //     }
 // }
 
+// ISR unico compartilhado pelos botoes. Mantido enxuto: faz debounce por
+// timestamp e apenas enfileira qual eixo (rotacao) deve ser enviado.
+void btn_callback(uint gpio, uint32_t events)
+{
+    static uint32_t last_us_r = 0;
+    static uint32_t last_us_l = 0;
+    uint32_t now = time_us_32();
+    uint8_t axis;
+
+    if (gpio == BTN_ROT_R_PIN)
+    {
+        if (now - last_us_r < BTN_DEBOUNCE_US)
+            return;
+        last_us_r = now;
+        axis = AXIS_ROT_R;
+    }
+    else if (gpio == BTN_ROT_L_PIN)
+    {
+        if (now - last_us_l < BTN_DEBOUNCE_US)
+            return;
+        last_us_l = now;
+        axis = AXIS_ROT_L;
+    }
+    else
+    {
+        return;
+    }
+
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xQueueSendFromISR(xQueueBtn, &axis, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+void button_task(void *p)
+{
+    // Inicializa aqui (e nao em main) para a IRQ ser atendida no core desta task.
+    gpio_init(BTN_ROT_R_PIN);
+    gpio_set_dir(BTN_ROT_R_PIN, GPIO_IN);
+    gpio_pull_up(BTN_ROT_R_PIN);
+
+    gpio_init(BTN_ROT_L_PIN);
+    gpio_set_dir(BTN_ROT_L_PIN, GPIO_IN);
+    gpio_pull_up(BTN_ROT_L_PIN);
+
+    // Botao para GND -> borda de descida. Um unico callback atende ambos.
+    gpio_set_irq_enabled_with_callback(BTN_ROT_R_PIN, GPIO_IRQ_EDGE_FALL, true, &btn_callback);
+    gpio_set_irq_enabled(BTN_ROT_L_PIN, GPIO_IRQ_EDGE_FALL, true);
+
+    uint8_t axis;
+    while (1)
+    {
+        if (xQueueReceive(xQueueBtn, &axis, portMAX_DELAY) == pdTRUE)
+            send_packet(axis, 0);
+    }
+}
+
 void uart_task(void *p)
 {
     gpio_init(PIN_INSTR_UART);
@@ -320,20 +388,24 @@ int main()
     xQueueMPU = xQueueCreate(32, sizeof(mpu_data_t));
     xQueuePos = xQueueCreate(32, sizeof(pos_data_t));
     xQueueColor = xQueueCreate(32, sizeof(color_data_t));
+    xQueueBtn = xQueueCreate(8, sizeof(uint8_t));
     xSemaphoreBtn = xSemaphoreCreateBinary();
+    xMutexUart = xSemaphoreCreateMutex();
 
-    TaskHandle_t h_mpu, h_fusion, h_pwm, h_uart;
+    TaskHandle_t h_mpu, h_fusion, h_pwm, h_uart, h_btn;
 
     xTaskCreate(mpu6050_task, "mpu6050_Task", 8192, NULL, 3, &h_mpu);
     xTaskCreate(fusion_task, "fusion_Task", 8192, NULL, 3, &h_fusion);
     xTaskCreate(pwm_task, "pwm_Task", 1024, NULL, 1, &h_pwm);
     xTaskCreate(uart_task, "uart_Task", 2048, NULL, 2, &h_uart);
+    xTaskCreate(button_task, "button_Task", 2048, NULL, 2, &h_btn);
     // xTaskCreate(stack_monitor_task, "stack_monitor", 512, NULL, 1, &h_monitor);
 
     vTaskCoreAffinitySet(h_mpu, CORE_0);
     vTaskCoreAffinitySet(h_fusion, CORE_1);
     vTaskCoreAffinitySet(h_pwm, CORE_1);
     vTaskCoreAffinitySet(h_uart, CORE_1);
+    vTaskCoreAffinitySet(h_btn, CORE_1);
     // vTaskCoreAffinitySet(h_monitor, CORE_1);
 
     vTaskStartScheduler();
