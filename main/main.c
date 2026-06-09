@@ -30,7 +30,9 @@ const int I2C_SCL_GPIO = 17;
 
 #define BTN_ROT_R_PIN 4 // gira direita -> seta cima
 #define BTN_ROT_L_PIN 5 // gira esquerda -> Z
-#define BTN_DEBOUNCE_US 50000
+#define BTN_PAUSE_PIN 2 // segurado -> pausa o IMU
+#define BTN_SPACE_PIN 3 // tecla space
+#define BTN_DEBOUNCE_US 20000
 
 #define CORE_0 (1 << 0)
 #define CORE_1 (1 << 1)
@@ -42,6 +44,7 @@ const int I2C_SCL_GPIO = 17;
 #define AXIS_CLICK 2
 #define AXIS_ROT_R 3
 #define AXIS_ROT_L 4
+#define AXIS_SPACE 5
 #define MAX_ABS_VALUE 94
 
 typedef struct
@@ -63,7 +66,6 @@ QueueHandle_t xQueueMPU;
 QueueHandle_t xQueuePos;
 QueueHandle_t xQueueColor;
 QueueHandle_t xQueueBtn;
-SemaphoreHandle_t xSemaphoreBtn;
 SemaphoreHandle_t xMutexUart;
 
 static void pwm_init_pin(uint pin)
@@ -122,7 +124,7 @@ static void send_packet(uint8_t axis, int8_t value)
     if (encoded == SYNC_BYTE)
         encoded = SYNC_BYTE - 1;
     uint8_t pkt[3] = {SYNC_BYTE, axis, encoded};
-    // Serializa a UART: uart_task (X/Y/click) e button_task (rotacao)
+    // Serializa a UART: uart_task (X/Y/click) e button_task (rotacao/space)
     // escrevem na mesma serial; sem o mutex os 3 bytes poderiam intercalar.
     xSemaphoreTake(xMutexUart, portMAX_DELAY);
     for (int i = 0; i < 3; i++)
@@ -205,7 +207,6 @@ void fusion_task(void *p)
             {
                 pos.click = true;
                 cooldown = CLICK_COOLDOWN;
-                xSemaphoreGive(xSemaphoreBtn);
 
                 // Ignora aceleracao do solavanco inicial
                 accelerometer.axis.x = 0.0f;
@@ -283,82 +284,75 @@ void pwm_task(void *p)
     }
 }
 
-// void stack_monitor_task(void *p)
-// {
-//     static TaskStatus_t tasks[16];
-//     while (true)
-//     {
-//         vTaskDelay(pdMS_TO_TICKS(2000));
-//         UBaseType_t n = uxTaskGetSystemState(tasks, 16, NULL);
-//         printf("+------------------+-------+\n");
-//         printf("| %-16s | %5s |\n", "task", "free");
-//         printf("+------------------+-------+\n");
-//         for (UBaseType_t i = 0; i < n; i++)
-//         {
-//             printf("| %-16s | %5u |\n",
-//                    tasks[i].pcTaskName,
-//                    (unsigned)tasks[i].usStackHighWaterMark);
-//         }
-//         printf("+------------------+-------+\n");
-//         printf("| heap livre min   | %5u |\n",
-//                (unsigned)xPortGetMinimumEverFreeHeapSize());
-//         printf("+------------------+-------+\n\n");
-//     }
-// }
-
-// ISR unico compartilhado pelos botoes. Mantido enxuto: faz debounce por
-// timestamp e apenas enfileira qual eixo (rotacao) deve ser enviado.
+// ISR unico dos 4 botoes. Mantido enxuto: filtra por timestamp e enfileira
+// o GPIO que gerou a borda. O pause nao usa debounce por timestamp porque
+// a task confirma o nivel real do pino depois; bordas extras de bounce so
+// geram releituras do mesmo nivel, sem efeito colateral.
 void btn_callback(uint gpio, uint32_t events)
 {
-    static uint32_t last_us_r = 0;
-    static uint32_t last_us_l = 0;
+    static uint32_t last_us[32];
     uint32_t now = time_us_32();
-    uint8_t axis;
 
-    if (gpio == BTN_ROT_R_PIN)
+    if (gpio == BTN_ROT_R_PIN || gpio == BTN_ROT_L_PIN || gpio == BTN_SPACE_PIN)
     {
-        if (now - last_us_r < BTN_DEBOUNCE_US)
+        if (now - last_us[gpio] < BTN_DEBOUNCE_US)
             return;
-        last_us_r = now;
-        axis = AXIS_ROT_R;
+        last_us[gpio] = now;
     }
-    else if (gpio == BTN_ROT_L_PIN)
-    {
-        if (now - last_us_l < BTN_DEBOUNCE_US)
-            return;
-        last_us_l = now;
-        axis = AXIS_ROT_L;
-    }
-    else
+    else if (gpio != BTN_PAUSE_PIN)
     {
         return;
     }
 
+    uint8_t pin = (uint8_t)gpio;
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xQueueSendFromISR(xQueueBtn, &axis, &xHigherPriorityTaskWoken);
+    xQueueSendFromISR(xQueueBtn, &pin, &xHigherPriorityTaskWoken);
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
 void button_task(void *p)
 {
-    // Inicializa aqui (e nao em main) para a IRQ ser atendida no core desta task.
-    gpio_init(BTN_ROT_R_PIN);
-    gpio_set_dir(BTN_ROT_R_PIN, GPIO_IN);
-    gpio_pull_up(BTN_ROT_R_PIN);
+    const uint pins[] = {BTN_ROT_R_PIN, BTN_ROT_L_PIN, BTN_SPACE_PIN};
+    for (int i = 0; i < 3; i++)
+    {
+        gpio_init(pins[i]);
+        gpio_set_dir(pins[i], GPIO_IN);
+        gpio_pull_up(pins[i]);
+    }
 
-    gpio_init(BTN_ROT_L_PIN);
-    gpio_set_dir(BTN_ROT_L_PIN, GPIO_IN);
-    gpio_pull_up(BTN_ROT_L_PIN);
-
-    // Botao para GND -> borda de descida. Um unico callback atende ambos.
+    // Pause (BTN_PAUSE_PIN) so precisa do pull-up: seu estado e lido direto
+    // pelo uart_task. So os botoes de evento usam IRQ.
     gpio_set_irq_enabled_with_callback(BTN_ROT_R_PIN, GPIO_IRQ_EDGE_FALL, true, &btn_callback);
     gpio_set_irq_enabled(BTN_ROT_L_PIN, GPIO_IRQ_EDGE_FALL, true);
+    gpio_set_irq_enabled(BTN_SPACE_PIN, GPIO_IRQ_EDGE_FALL, true);
 
-    uint8_t axis;
+    uint8_t pin;
     while (1)
     {
-        if (xQueueReceive(xQueueBtn, &axis, portMAX_DELAY) == pdTRUE)
-            send_packet(axis, 0);
+        if (xQueueReceive(xQueueBtn, &pin, portMAX_DELAY) == pdTRUE)
+        {
+            // Confirma o nivel apos a borda: bounce ao soltar gera borda de
+            // descida falsa, mas 5ms depois o pino ja esta alto e descarta.
+            vTaskDelay(pdMS_TO_TICKS(5));
+            if (!gpio_get(pin))
+            {
+                uint8_t axis = (pin == BTN_ROT_R_PIN)   ? AXIS_ROT_R
+                               : (pin == BTN_ROT_L_PIN) ? AXIS_ROT_L
+                                                        : AXIS_SPACE;
+                send_packet(axis, 0);
+            }
+        }
+    }
+}
+
+void pause_debug_task(void *p)
+{
+    while (1)
+    {
+        // axis 6 = nivel atual do pino de pause. 0 = solto (alto), 1 = apertado
+        // (baixo). DIAGNOSTICO TEMPORARIO: remover depois.
+        send_packet(6, gpio_get(BTN_PAUSE_PIN) ? 0 : 1);
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
 
@@ -371,6 +365,12 @@ void uart_task(void *p)
     {
         if (xQueueReceive(xQueuePos, &pos, portMAX_DELAY) == pdTRUE)
         {
+            // Pause do IMU: le o nivel do pino direto. Pino baixo = segurando
+            // = pausado. Sem flag intermediario, sem borda, sem race: o estado
+            // do pause E o nivel do GPIO no instante do envio.
+            if (!gpio_get(BTN_PAUSE_PIN))
+                continue;
+
             gpio_put(PIN_INSTR_UART, 1);
             send_packet(AXIS_X, pos.x);
             send_packet(AXIS_Y, pos.y);
@@ -385,11 +385,16 @@ int main()
 {
     stdio_init_all();
 
+    // Pause: input com pull-up, lido direto pelo uart_task. Inicializado aqui
+    // (antes do scheduler) para estar pronto antes da primeira leitura.
+    gpio_init(BTN_PAUSE_PIN);
+    gpio_set_dir(BTN_PAUSE_PIN, GPIO_IN);
+    gpio_pull_up(BTN_PAUSE_PIN);
+
     xQueueMPU = xQueueCreate(32, sizeof(mpu_data_t));
     xQueuePos = xQueueCreate(32, sizeof(pos_data_t));
     xQueueColor = xQueueCreate(32, sizeof(color_data_t));
     xQueueBtn = xQueueCreate(8, sizeof(uint8_t));
-    xSemaphoreBtn = xSemaphoreCreateBinary();
     xMutexUart = xSemaphoreCreateMutex();
 
     TaskHandle_t h_mpu, h_fusion, h_pwm, h_uart, h_btn;
@@ -399,14 +404,13 @@ int main()
     xTaskCreate(pwm_task, "pwm_Task", 1024, NULL, 1, &h_pwm);
     xTaskCreate(uart_task, "uart_Task", 2048, NULL, 2, &h_uart);
     xTaskCreate(button_task, "button_Task", 2048, NULL, 2, &h_btn);
-    // xTaskCreate(stack_monitor_task, "stack_monitor", 512, NULL, 1, &h_monitor);
+    xTaskCreate(pause_debug_task, "pause_dbg", 1024, NULL, 1, NULL);
 
     vTaskCoreAffinitySet(h_mpu, CORE_0);
     vTaskCoreAffinitySet(h_fusion, CORE_1);
     vTaskCoreAffinitySet(h_pwm, CORE_1);
     vTaskCoreAffinitySet(h_uart, CORE_1);
     vTaskCoreAffinitySet(h_btn, CORE_1);
-    // vTaskCoreAffinitySet(h_monitor, CORE_1);
 
     vTaskStartScheduler();
     while (true)

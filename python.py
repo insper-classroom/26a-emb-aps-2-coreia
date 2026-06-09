@@ -2,9 +2,10 @@
 
 import sys
 import glob
+import time
 import serial
-import pyautogui
-pyautogui.PAUSE = 0  # Remove delay between actions
+from pynput.mouse import Controller as MouseCtl, Button
+from pynput.keyboard import Controller as KbCtl, Key
 import tkinter as tk
 from tkinter import ttk
 from tkinter import messagebox
@@ -17,90 +18,86 @@ SYNC_BYTE    = 0xFF
 VALUE_OFFSET = 128
 AXIS_X       = 0
 AXIS_Y       = 1
-AXIS_CLICK   = 2          # novo: evento de clique enviado pelo firmware
+AXIS_CLICK   = 2          # evento de clique enviado pelo firmware
 AXIS_ROT_R   = 3          # botao: girar direita -> seta cima
 AXIS_ROT_L   = 4          # botao: girar esquerda -> Z
+AXIS_SPACE   = 5          # botao: space
 MAX_ABS_VALUE = 95
 
 # Coloca em True para imprimir cada pacote decodificado no terminal
-DEBUG = False
+DEBUG = True
 
 
-def move_mouse(axis, value):
-    """Move o mouse de acordo com o eixo e valor recebidos."""
-    if axis == AXIS_X:
-        pyautogui.moveRel(int(value / 10), 0)
-    elif axis == AXIS_Y:
-        pyautogui.moveRel(0, int(value / 10))
-
-
-def parse_data(data):
-    """
-    Interpreta 2 bytes de payload: [axis, value+128].
-    Retorna (axis, value) com value já de volta em [-95, +95].
-    """
-    axis  = data[0]
-    value = data[1] - VALUE_OFFSET
-    return axis, value
+mouse = MouseCtl()
+kb = KbCtl()
 
 
 def controle(ser):
     """
     Loop principal.
     Protocolo: 0xFF (sync) + 2 bytes [axis, value+128].
-    axis = 2 indica um clique do mouse.
+
+    Drena tudo que chegou na serial a cada iteracao e aplica apenas o ULTIMO
+    estado de X/Y (um unico mouse.move por ciclo). Cliques e botoes sao eventos
+    discretos e executam todos. Usa pynput (chamadas em microssegundos) em vez
+    de pyautogui (dezenas de ms por chamada), que nao acompanhava 200 pacotes/s.
+
+    O pause do IMU e resolvido inteiro no firmware: enquanto pausado o Pico
+    para de enviar X/Y/click, e o cursor congela porque so anda quando chega
+    pacote. Nenhum tratamento e necessario aqui.
     """
+    ser.timeout = 0
+    buf = bytearray()
+    last = {AXIS_X: 0, AXIS_Y: 0}
     while True:
-        # ── Sincronização ──────────────────────────────────────────────────────
-        sync_byte = ser.read(size=1)
-        if not sync_byte:
-            continue
-        if sync_byte[0] != SYNC_BYTE:
-            continue
+        chunk = ser.read(4096)
+        if chunk:
+            buf += chunk
 
-        data = ser.read(size=2)
-        if len(data) < 2:
-            continue
+        moved = False
+        while len(buf) >= 3:
+            if buf[0] != SYNC_BYTE:
+                del buf[0]
+                continue
+            # Se o payload começa com 0xFF é na verdade o próximo header — resync
+            if buf[1] == SYNC_BYTE:
+                del buf[0]
+                continue
 
-        # Se o primeiro byte do payload for 0xFF é na verdade o próximo header — resync
-        if data[0] == SYNC_BYTE:
-            continue
+            axis  = buf[1]
+            value = buf[2] - VALUE_OFFSET
+            del buf[:3]
 
-        axis, value = parse_data(data)
+            if axis == AXIS_CLICK:
+                mouse.click(Button.left)
+                if DEBUG:
+                    print("CLICK!")
+            elif axis == AXIS_ROT_R:
+                kb.tap(Key.up)
+                if DEBUG:
+                    print("ROT R (up)")
+            elif axis == AXIS_ROT_L:
+                kb.tap('z')
+                if DEBUG:
+                    print("ROT L (z)")
+            elif axis == AXIS_SPACE:
+                kb.tap(Key.space)
+                if DEBUG:
+                    print("SPACE")
+            elif axis == 6:
+                print(f"pino pause -> {'APERTADO' if value else 'solto'}")
+            elif axis in (AXIS_X, AXIS_Y) and abs(value) <= MAX_ABS_VALUE:
+                last[axis] = value
+                moved = True
 
-        # ── Evento de clique ───────────────────────────────────────────────────
-        if axis == AXIS_CLICK:
-            pyautogui.click()
-            if DEBUG:
-                print("CLICK!")
-            continue
+        if moved:
+            mouse.move(int(last[AXIS_X] / 10), int(last[AXIS_Y] / 10))
 
-        # ── Rotacao (teclado) ──────────────────────────────────────────────────
-        if axis == AXIS_ROT_R:
-            pyautogui.press('up')
-            if DEBUG:
-                print("ROT R (up)")
-            continue
-        if axis == AXIS_ROT_L:
-            pyautogui.press('z')
-            if DEBUG:
-                print("ROT L (z)")
-            continue
-
-        # ── Movimento do mouse ─────────────────────────────────────────────────
-        if axis not in (AXIS_X, AXIS_Y):
-            continue
-        if value < -MAX_ABS_VALUE or value > MAX_ABS_VALUE:
-            continue
-
-        if DEBUG:
-            print(f"axis={axis} value={value}")
-
-        move_mouse(axis, value)
+        time.sleep(0.001)
 
 
 # ==============================================================================
-#  Interface gráfica e utilitários (inalterados em relação ao lab anterior)
+#  Interface gráfica e utilitários
 # ==============================================================================
 
 def serial_ports():
