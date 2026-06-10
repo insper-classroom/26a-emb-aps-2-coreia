@@ -16,7 +16,7 @@ endif()
 set(PICO_BOARD pico2 CACHE STRING "Board type")
 set(FREERTOS_KERNEL_PATH ${CMAKE_CURRENT_SOURCE_DIR}/FreeRTOS-Kernel)
 
-cmake_minimum_required(VERSION 3.12)
+cmake_minimum_required(VERSION 3.15)
 
 # Pull in SDK (must be before project)
 include(pico_sdk_import.cmake)
@@ -33,12 +33,10 @@ endif()
 
 set(PICO_EXAMPLES_PATH ${PROJECT_SOURCE_DIR})
 
-# If you want debug output from USB (pass -DPICO_STDIO_USB=1) this ensures you don't lose any debug output while USB is set up
 if (NOT DEFINED PICO_STDIO_USB_CONNECT_WAIT_TIMEOUT_MS)
     set(PICO_STDIO_USB_CONNECT_WAIT_TIMEOUT_MS 3000)
 endif()
 
-# Allow using the example keys, as this is the examples repository
 if (NOT DEFINED PICO_ALLOW_EXAMPLE_KEYS)
     set(PICO_ALLOW_EXAMPLE_KEYS 1)
 endif()
@@ -46,31 +44,20 @@ endif()
 # Initialize the SDK
 pico_sdk_init()
 
-function(add_subdirectory_exclude_platforms NAME)
-    if (ARGN)
-        if (PICO_PLATFORM IN_LIST ARGN)
-            message("Skipping ${NAME} example which is unsupported on this platform")
-            return()
-        endif()
-        foreach(PATTERN IN LISTS ARGN)
-            string(REGEX MATCH "${PATTERN}" MATCHED "${PICO_PLATFORM}")
-            if (MATCHED)
-                message("Skipping ${NAME} example which is unsupported on this platform")
-                return()
-            endif()
-        endforeach()
-    endif()
-    add_subdirectory(${NAME})
-endfunction()
+# ── Edge Impulse: pastas do modelo ──────────────────────────────────────────
+set(MODEL_FOLDER ei-model)
+set(EI_SDK_FOLDER ${MODEL_FOLDER}/edge-impulse-sdk)
+
+# Flags exigidas pela SDK do Edge Impulse.
+add_definitions(-DEIDSP_QUANTIZE_FILTERBANK=0
+                -DEI_CLASSIFIER_TFLITE_ENABLE_CMSIS_NN=1
+                -DARM_MATH_LOOPUNROLL)
 
 add_compile_options(-Wall
-        -Wno-format          # int != int32_t as far as the compiler is concerned because gcc has int32_t as long int
-        -Wno-unused-function # we have some for the docs that aren't called
+        -Wno-format
+        -Wno-unused-function
+        -Wno-maybe-uninitialized
         )
-if (CMAKE_C_COMPILER_ID STREQUAL "GNU")
-    add_compile_options(-Wno-maybe-uninitialized)
-endif()
 
-# Hardware-specific examples in subdirectories:
 add_subdirectory(Fusion)
 add_subdirectory(main)
