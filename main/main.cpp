@@ -10,13 +10,12 @@
 #include "hardware/i2c.h"
 #include "hardware/pwm.h"
 #include "Fusion.h"
+#include "audio_jogo.h"
 
-// Edge Impulse: classificador de gestos. Roda no modo gesto (pause segurado).
-// ei_run_classifier.h ja define run_classifier() (com corpo) dentro do
-// namespace ei, entao basta inclui-lo; nao redeclarar.
+// Edge Impulse classifier used by ai_task while the pause button is held.
 #include "edge-impulse-sdk/classifier/ei_run_classifier.h"
 
-#define SAMPLE_PERIOD (0.01f)
+#define SAMPLE_PERIOD (EI_CLASSIFIER_INTERVAL_MS / 1000.0f)
 #define WARMUP_SAMPLES 200
 #define SCALE_DEG 45.0f
 
@@ -33,11 +32,16 @@ const int I2C_SCL_GPIO = 17;
 #define PIN_INSTR_PWM 12
 #define PIN_INSTR_UART 13
 
-#define BTN_ROT_R_PIN 4 // gira direita -> seta cima
-#define BTN_ROT_L_PIN 5 // gira esquerda -> Z
 #define BTN_PAUSE_PIN 2 // segurado -> pausa o IMU
-#define BTN_SPACE_PIN 3 // tecla space
+#define BTN_ENTER_PIN 3
+#define BTN_ROT_R_PIN 4 // gira direita -> seta cima
+#define BTN_ESC_PIN 5
 #define BTN_DEBOUNCE_US 20000
+
+#define AUDIO_PIN 6
+#define AUDIO_SAMPLE_RATE 11000
+#define AUDIO_MIDPOINT 121
+#define AUDIO_GAIN 2
 
 #define CORE_0 (1 << 0)
 #define CORE_1 (1 << 1)
@@ -48,14 +52,43 @@ const int I2C_SCL_GPIO = 17;
 #define AXIS_Y 1
 #define AXIS_CLICK 2
 #define AXIS_ROT_R 3
-#define AXIS_ROT_L 4
 #define AXIS_SPACE 5
+#define AXIS_AI_CONFIDENCE 6
+#define AXIS_AI_STATUS 7
+#define AXIS_AI_PROGRESS 8
+#define AXIS_DEBUG_ACCEL_X 9
+#define AXIS_DEBUG_ACCEL_Y 10
+#define AXIS_DEBUG_ACCEL_Z 11
+#define AXIS_AI_IDLE_CONFIDENCE 12
+#define AXIS_AI_ANOMALY 13
+#define AXIS_AI_DSP_MS 14
+#define AXIS_AI_CLASSIFICATION_MS 15
+#define AXIS_AI_QUEUE_DEPTH 16
+#define AXIS_AI_ERROR_CODE 17
+#define AXIS_IMU_READ_ERRORS 18
+#define AXIS_ENTER 19
+#define AXIS_ESC 20
+#define AXIS_AUDIO_STATUS 21
+#define AXIS_AUDIO_INDEX_LOW 22
+#define AXIS_AUDIO_INDEX_MID 23
+#define AXIS_AUDIO_INDEX_HIGH 24
 #define MAX_ABS_VALUE 94
 
-// Gesto: confianca minima para aceitar a classe "tetris" e disparar o hard drop.
-#define GESTURE_THRESHOLD 0.7f
-// Cooldown apos um hard drop por gesto, em ciclos de janela, para nao repetir.
-#define GESTURE_COOLDOWN_MS 600
+#define AUDIO_STATUS_STARTED 1
+#define AUDIO_STATUS_PAUSED 2
+#define AUDIO_STATUS_RESUMED 3
+
+#define AI_GESTURE_LABEL "tetris"
+#define AI_GESTURE_THRESHOLD 0.7f
+#define AI_GESTURE_COOLDOWN_MS 600
+#define AI_INFERENCE_STRIDE_SAMPLES (EI_CLASSIFIER_RAW_SAMPLE_COUNT / 4)
+
+#define AI_STATUS_TASK_STARTED 1
+#define AI_STATUS_PAUSE_ACTIVE 2
+#define AI_STATUS_WINDOW_READY 3
+#define AI_STATUS_CLASSIFIER_ERROR 4
+#define AI_STATUS_TETRIS_DETECTED 5
+#define AI_STATUS_PAUSE_RELEASED 6
 
 typedef struct
 {
@@ -73,14 +106,18 @@ typedef struct
 } color_data_t;
 
 QueueHandle_t xQueueMPU;
+QueueHandle_t xQueueAI;
 QueueHandle_t xQueuePos;
 QueueHandle_t xQueueColor;
 QueueHandle_t xQueueBtn;
 SemaphoreHandle_t xMutexUart;
-// Serializa o acesso I2C ao MPU6050 entre o leitor do cursor e o leitor de
-// gestos, que nunca rodam juntos (pause alterna entre eles) mas compartilham
-// o barramento.
 SemaphoreHandle_t xMutexI2C;
+static repeating_timer_t audio_timer;
+static volatile uint32_t audio_index = 0;
+static volatile bool audio_started = false;
+static volatile bool audio_paused = false;
+
+static void send_packet(uint8_t axis, int8_t value);
 
 static void pwm_init_pin(uint pin)
 {
@@ -103,12 +140,96 @@ static void mpu6050_init()
     gpio_pull_up(I2C_SDA_GPIO);
     gpio_pull_up(I2C_SCL_GPIO);
 
-    uint8_t buf[] = {0x6B, 0x00};
-    i2c_write_blocking(i2c0, MPU_ADDRESS, buf, 2, false);
+    // Wake the MPU6050 and make its output rate/ranges explicit. With the
+    // default 1 kHz gyro output rate, divider 10 gives 90.9 Hz, matching the
+    // model's 91 Hz training frequency.
+    const uint8_t config[][2] = {
+        {0x6B, 0x00}, // PWR_MGMT_1: wake
+        {0x1A, 0x03}, // CONFIG: DLPF enabled, 1 kHz internal sample rate
+        {0x19, 0x0A}, // SMPLRT_DIV: 1000 / (1 + 10) = 90.9 Hz
+        {0x1B, 0x00}, // GYRO_CONFIG: +/-250 deg/s
+        {0x1C, 0x00}, // ACCEL_CONFIG: +/-2g, 16384 LSB/g
+    };
+    for (size_t ix = 0; ix < sizeof(config) / sizeof(config[0]); ix++)
+        i2c_write_blocking(i2c0, MPU_ADDRESS, config[ix], 2, false);
     vTaskDelay(pdMS_TO_TICKS(100));
 }
 
-static void mpu6050_read_raw(int16_t accel[3], int16_t gyro[3], int16_t *temp)
+static bool audio_timer_callback(repeating_timer_t *timer)
+{
+    if (!audio_started || audio_paused)
+    {
+        pwm_set_gpio_level(AUDIO_PIN, AUDIO_MIDPOINT);
+        return true;
+    }
+
+    int32_t amplified =
+        AUDIO_MIDPOINT + ((int32_t)WAV_DATA[audio_index] - AUDIO_MIDPOINT) * AUDIO_GAIN;
+    if (amplified < 0)
+        amplified = 0;
+    else if (amplified > 255)
+        amplified = 255;
+    pwm_set_gpio_level(AUDIO_PIN, (uint16_t)amplified);
+    audio_index++;
+    if (audio_index >= WAV_DATA_LENGTH)
+        audio_index = 0;
+    return true;
+}
+
+static void audio_init()
+{
+    pwm_init_pin(AUDIO_PIN);
+    gpio_set_drive_strength(AUDIO_PIN, GPIO_DRIVE_STRENGTH_2MA);
+    gpio_set_slew_rate(AUDIO_PIN, GPIO_SLEW_RATE_SLOW);
+    pwm_set_gpio_level(AUDIO_PIN, AUDIO_MIDPOINT);
+    bool started = add_repeating_timer_us(
+        -((1000000 + (AUDIO_SAMPLE_RATE / 2)) / AUDIO_SAMPLE_RATE),
+        audio_timer_callback,
+        NULL,
+        &audio_timer);
+    if (!started)
+        panic("Audio timer creation failed");
+}
+
+static void audio_start()
+{
+    if (!audio_started)
+    {
+        audio_started = true;
+        audio_paused = false;
+        send_packet(AXIS_AUDIO_STATUS, AUDIO_STATUS_STARTED);
+    }
+}
+
+static void audio_toggle_pause()
+{
+    if (audio_started)
+    {
+        audio_paused = !audio_paused;
+        send_packet(
+            AXIS_AUDIO_STATUS,
+            audio_paused ? AUDIO_STATUS_PAUSED : AUDIO_STATUS_RESUMED);
+    }
+}
+
+void audio_debug_task(void *p)
+{
+    while (1)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (!audio_started)
+            continue;
+
+        // Encode the full sample index as three base-95 digits because each
+        // serial packet can carry only values from 0 through 94.
+        const uint32_t index = audio_index;
+        send_packet(AXIS_AUDIO_INDEX_LOW, index % 95);
+        send_packet(AXIS_AUDIO_INDEX_MID, (index / 95) % 95);
+        send_packet(AXIS_AUDIO_INDEX_HIGH, (index / (95 * 95)) % 95);
+    }
+}
+
+static bool mpu6050_read_raw(int16_t accel[3], int16_t gyro[3], int16_t *temp)
 {
     uint8_t buffer[14];
     uint8_t val = 0x3B;
@@ -117,15 +238,19 @@ static void mpu6050_read_raw(int16_t accel[3], int16_t gyro[3], int16_t *temp)
     if (ret < 0)
     {
         xSemaphoreGive(xMutexI2C);
-        return;
+        return false;
     }
-    i2c_read_blocking(i2c0, MPU_ADDRESS, buffer, 14, false);
+    ret = i2c_read_blocking(i2c0, MPU_ADDRESS, buffer, 14, false);
     xSemaphoreGive(xMutexI2C);
+    if (ret != 14)
+        return false;
+
     for (int i = 0; i < 3; i++)
         accel[i] = (int16_t)((buffer[i * 2] << 8) | buffer[i * 2 + 1]);
     *temp = (int16_t)((buffer[6] << 8) | buffer[7]);
     for (int i = 0; i < 3; i++)
         gyro[i] = (int16_t)((buffer[8 + i * 2] << 8) | buffer[8 + i * 2 + 1]);
+    return true;
 }
 
 static int8_t clamp94(float v)
@@ -151,6 +276,23 @@ static void send_packet(uint8_t axis, int8_t value)
     xSemaphoreGive(xMutexUart);
 }
 
+static int8_t scale_percent(float value)
+{
+    return clamp94(value * MAX_ABS_VALUE);
+}
+
+static void require_handle(const void *handle)
+{
+    if (handle == NULL)
+        panic("FreeRTOS object allocation failed");
+}
+
+static void require_task_created(BaseType_t result)
+{
+    if (result != pdPASS)
+        panic("FreeRTOS task creation failed");
+}
+
 void mpu6050_task(void *p)
 {
     gpio_init(PIN_INSTR_MPU);
@@ -159,21 +301,41 @@ void mpu6050_task(void *p)
     mpu_data_t data;
     int16_t temp;
     memset(&data, 0, sizeof(data));
+    TickType_t last_wake = xTaskGetTickCount();
+    uint32_t paused_samples = 0;
+    uint32_t read_errors = 0;
     while (1)
     {
-        // Modo gesto (pause segurado): a gesture_task assume o sensor. O cursor
-        // ja esta congelado, entao parar de alimentar a fusion nao tem efeito
-        // visivel e evita intercalar leituras na janela do classificador.
-        if (!gpio_get(BTN_PAUSE_PIN))
+        gpio_put(PIN_INSTR_MPU, 1);
+        if (!mpu6050_read_raw(data.accel, data.gyro, &temp))
         {
-            vTaskDelay(pdMS_TO_TICKS(20));
+            read_errors++;
+            if ((read_errors % 10) == 1)
+                send_packet(AXIS_IMU_READ_ERRORS, clamp94(read_errors));
+            gpio_put(PIN_INSTR_MPU, 0);
+            vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(11));
             continue;
         }
-        gpio_put(PIN_INSTR_MPU, 1);
-        mpu6050_read_raw(data.accel, data.gyro, &temp);
         xQueueSend(xQueueMPU, &data, 0);
+        if (!gpio_get(BTN_PAUSE_PIN))
+        {
+            xQueueSend(xQueueAI, &data, 0);
+            paused_samples++;
+            if ((paused_samples % AI_INFERENCE_STRIDE_SAMPLES) == 0)
+            {
+                // Acceleration snapshots are reported in g * 20.
+                send_packet(AXIS_DEBUG_ACCEL_X, clamp94(data.accel[0] / 819.2f));
+                send_packet(AXIS_DEBUG_ACCEL_Y, clamp94(data.accel[1] / 819.2f));
+                send_packet(AXIS_DEBUG_ACCEL_Z, clamp94(data.accel[2] / 819.2f));
+                send_packet(AXIS_AI_QUEUE_DEPTH, clamp94(uxQueueMessagesWaiting(xQueueAI)));
+            }
+        }
+        else
+        {
+            paused_samples = 0;
+        }
         gpio_put(PIN_INSTR_MPU, 0);
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(11));
     }
 }
 
@@ -209,8 +371,6 @@ void fusion_task(void *p)
 
             gpio_put(PIN_INSTR_FUSION, 1);
 
-            // Inicializacao campo a campo: designated initializers aninhados
-            // (.axis.x) nao compilam de forma portavel em C++.
             FusionVector gyroscope;
             gyroscope.axis.x = (raw.gyro[0] / 131.0f) - gyro_bias[0];
             gyroscope.axis.y = (raw.gyro[1] / 131.0f) - gyro_bias[1];
@@ -321,7 +481,7 @@ void btn_callback(uint gpio, uint32_t events)
     static uint32_t last_us[32];
     uint32_t now = time_us_32();
 
-    if (gpio == BTN_ROT_R_PIN || gpio == BTN_ROT_L_PIN || gpio == BTN_SPACE_PIN)
+    if (gpio == BTN_ROT_R_PIN || gpio == BTN_ENTER_PIN || gpio == BTN_ESC_PIN)
     {
         if (now - last_us[gpio] < BTN_DEBOUNCE_US)
             return;
@@ -340,8 +500,8 @@ void btn_callback(uint gpio, uint32_t events)
 
 void button_task(void *p)
 {
-    const uint pins[] = {BTN_ROT_R_PIN, BTN_ROT_L_PIN, BTN_SPACE_PIN};
-    for (int i = 0; i < 3; i++)
+    const uint pins[] = {BTN_ROT_R_PIN, BTN_ENTER_PIN, BTN_ESC_PIN};
+    for (size_t i = 0; i < sizeof(pins) / sizeof(pins[0]); i++)
     {
         gpio_init(pins[i]);
         gpio_set_dir(pins[i], GPIO_IN);
@@ -351,8 +511,8 @@ void button_task(void *p)
     // Pause (BTN_PAUSE_PIN) so precisa do pull-up: seu estado e lido direto
     // pelo uart_task. So os botoes de evento usam IRQ.
     gpio_set_irq_enabled_with_callback(BTN_ROT_R_PIN, GPIO_IRQ_EDGE_FALL, true, &btn_callback);
-    gpio_set_irq_enabled(BTN_ROT_L_PIN, GPIO_IRQ_EDGE_FALL, true);
-    gpio_set_irq_enabled(BTN_SPACE_PIN, GPIO_IRQ_EDGE_FALL, true);
+    gpio_set_irq_enabled(BTN_ENTER_PIN, GPIO_IRQ_EDGE_FALL, true);
+    gpio_set_irq_enabled(BTN_ESC_PIN, GPIO_IRQ_EDGE_FALL, true);
 
     uint8_t pin;
     while (1)
@@ -364,76 +524,125 @@ void button_task(void *p)
             vTaskDelay(pdMS_TO_TICKS(5));
             if (!gpio_get(pin))
             {
+                if (pin == BTN_ENTER_PIN)
+                    audio_start();
+                else if (pin == BTN_ESC_PIN)
+                    audio_toggle_pause();
+
                 uint8_t axis = (pin == BTN_ROT_R_PIN)   ? AXIS_ROT_R
-                               : (pin == BTN_ROT_L_PIN) ? AXIS_ROT_L
-                                                        : AXIS_SPACE;
+                               : (pin == BTN_ENTER_PIN) ? AXIS_ENTER
+                                                        : AXIS_ESC;
                 send_packet(axis, 0);
             }
         }
     }
 }
 
-// Modo gesto: ativo enquanto BTN_PAUSE_PIN esta segurado (pino baixo). Nesse
-// estado o cursor ja esta congelado (uart_task nao envia), entao o sensor fica
-// livre para alimentar o classificador. Acumula uma janela de acelerometro,
-// roda a inferencia e, se a classe "tetris" passar do limiar, dispara o hard
-// drop (mesma acao do botao de space). Fora do modo gesto, dorme.
-void gesture_task(void *p)
+void ai_task(void *p)
 {
-    int16_t accel[3], gyro[3], temp;
-    const int frame = EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE; // 91 * 3
-    static float buffer[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];
+    mpu_data_t raw;
+    static float ring[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];
+    static float inference_buffer[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];
+    const int frame_values = EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE;
+    int write_index = 0;
+    int collected_samples = 0;
+    int samples_since_inference = 0;
+    bool pause_was_active = false;
+
+    send_packet(AXIS_AI_STATUS, AI_STATUS_TASK_STARTED);
 
     while (1)
     {
-        // So coleta quando o pause esta segurado. Fora disso, espera.
         if (gpio_get(BTN_PAUSE_PIN))
         {
+            if (pause_was_active)
+                send_packet(AXIS_AI_STATUS, AI_STATUS_PAUSE_RELEASED);
+            xQueueReset(xQueueAI);
+            write_index = 0;
+            collected_samples = 0;
+            samples_since_inference = 0;
+            pause_was_active = false;
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
 
-        // Acumula a janela: 91 amostras de 3 eixos do acelerometro, ~11ms cada.
-        for (int ix = 0; ix < frame; ix += 3)
+        if (!pause_was_active)
         {
-            mpu6050_read_raw(accel, gyro, &temp);
-            buffer[ix + 0] = accel[0];
-            buffer[ix + 1] = accel[1];
-            buffer[ix + 2] = accel[2];
-            vTaskDelay(pdMS_TO_TICKS(10));
-
-            // Pause soltou no meio da coleta: aborta a janela.
-            if (gpio_get(BTN_PAUSE_PIN))
-                break;
+            send_packet(AXIS_AI_STATUS, AI_STATUS_PAUSE_ACTIVE);
+            pause_was_active = true;
         }
-        if (gpio_get(BTN_PAUSE_PIN))
+
+        if (xQueueReceive(xQueueAI, &raw, pdMS_TO_TICKS(20)) != pdTRUE)
             continue;
 
+        // This model was trained with raw MPU6050 accelerometer counts.
+        ring[write_index + 0] = raw.accel[0];
+        ring[write_index + 1] = raw.accel[1];
+        ring[write_index + 2] = raw.accel[2];
+        write_index = (write_index + EI_CLASSIFIER_RAW_SAMPLES_PER_FRAME) % frame_values;
+
+        if (collected_samples < EI_CLASSIFIER_RAW_SAMPLE_COUNT)
+            collected_samples++;
+        samples_since_inference++;
+
+        if ((collected_samples % AI_INFERENCE_STRIDE_SAMPLES) == 0)
+            send_packet(AXIS_AI_PROGRESS,
+                        scale_percent((float)collected_samples / EI_CLASSIFIER_RAW_SAMPLE_COUNT));
+
+        if (collected_samples < EI_CLASSIFIER_RAW_SAMPLE_COUNT ||
+            samples_since_inference < AI_INFERENCE_STRIDE_SAMPLES)
+            continue;
+
+        samples_since_inference = 0;
+        for (int ix = 0; ix < frame_values; ix++)
+            inference_buffer[ix] = ring[(write_index + ix) % frame_values];
+        send_packet(AXIS_AI_STATUS, AI_STATUS_WINDOW_READY);
+
         ei::signal_t signal;
-        if (ei::numpy::signal_from_buffer(buffer, frame, &signal) != 0)
+        if (ei::numpy::signal_from_buffer(inference_buffer, frame_values, &signal) != 0)
             continue;
 
         ei_impulse_result_t result = {0};
-        // run_classifier() vive no namespace anonimo do header (extern "C"),
-        // nao em ei::. Chamada qualificada com ei:: liga a uma declaracao
-        // externa sem definicao -> "undefined reference". Chamar sem ei::.
-        if (run_classifier(&signal, &result, false) != EI_IMPULSE_OK)
-            continue;
-
-        // Escolhe a classe de maior probabilidade.
-        int best = 0;
-        for (int ix = 1; ix < EI_CLASSIFIER_LABEL_COUNT; ix++)
-            if (result.classification[ix].value > result.classification[best].value)
-                best = ix;
-
-        const char *label = result.classification[best].label;
-        float conf = result.classification[best].value;
-
-        if (strcmp(label, "tetris") == 0 && conf >= GESTURE_THRESHOLD)
+        EI_IMPULSE_ERROR classifier_error = run_classifier(&signal, &result, false);
+        if (classifier_error != EI_IMPULSE_OK)
         {
-            send_packet(AXIS_SPACE, 0);
-            // Cooldown: evita repetir o hard drop com o mesmo gesto.
-            vTaskDelay(pdMS_TO_TICKS(GESTURE_COOLDOWN_MS));
+            send_packet(AXIS_AI_STATUS, AI_STATUS_CLASSIFIER_ERROR);
+            send_packet(AXIS_AI_ERROR_CODE, clamp94(classifier_error));
+            continue;
+        }
+
+        send_packet(AXIS_AI_DSP_MS, clamp94(result.timing.dsp));
+        send_packet(AXIS_AI_CLASSIFICATION_MS, clamp94(result.timing.classification));
+        send_packet(AXIS_AI_ANOMALY, clamp94(result.anomaly * 10.0f));
+
+        for (int ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++)
+        {
+            if (strcmp(result.classification[ix].label, "idle") == 0)
+            {
+                send_packet(AXIS_AI_IDLE_CONFIDENCE,
+                            scale_percent(result.classification[ix].value));
+                continue;
+            }
+
+            if (strcmp(result.classification[ix].label, AI_GESTURE_LABEL) != 0)
+                continue;
+
+            send_packet(AXIS_AI_CONFIDENCE,
+                        scale_percent(result.classification[ix].value));
+
+            if (result.classification[ix].value >= AI_GESTURE_THRESHOLD)
+            {
+                send_packet(AXIS_AI_STATUS, AI_STATUS_TETRIS_DETECTED);
+                send_packet(AXIS_SPACE, 0);
+                // Drop samples accumulated during the cooldown. Replaying them
+                // quickly would destroy the model's real-time sample spacing.
+                vTaskDelay(pdMS_TO_TICKS(AI_GESTURE_COOLDOWN_MS));
+                xQueueReset(xQueueAI);
+                write_index = 0;
+                collected_samples = 0;
+                samples_since_inference = 0;
+                break;
+            }
         }
     }
 }
@@ -472,31 +681,47 @@ int main()
     gpio_init(BTN_PAUSE_PIN);
     gpio_set_dir(BTN_PAUSE_PIN, GPIO_IN);
     gpio_pull_up(BTN_PAUSE_PIN);
+    audio_init();
 
     xQueueMPU = xQueueCreate(32, sizeof(mpu_data_t));
+    xQueueAI = xQueueCreate(128, sizeof(mpu_data_t));
     xQueuePos = xQueueCreate(32, sizeof(pos_data_t));
     xQueueColor = xQueueCreate(32, sizeof(color_data_t));
     xQueueBtn = xQueueCreate(8, sizeof(uint8_t));
     xMutexUart = xSemaphoreCreateMutex();
     xMutexI2C = xSemaphoreCreateMutex();
 
-    TaskHandle_t h_mpu, h_fusion, h_pwm, h_uart, h_btn, h_gesture;
+    require_handle(xQueueMPU);
+    require_handle(xQueueAI);
+    require_handle(xQueuePos);
+    require_handle(xQueueColor);
+    require_handle(xQueueBtn);
+    require_handle(xMutexUart);
+    require_handle(xMutexI2C);
 
-    xTaskCreate(mpu6050_task, "mpu6050_Task", 8192, NULL, 3, &h_mpu);
-    xTaskCreate(fusion_task, "fusion_Task", 8192, NULL, 3, &h_fusion);
-    xTaskCreate(pwm_task, "pwm_Task", 1024, NULL, 1, &h_pwm);
-    xTaskCreate(uart_task, "uart_Task", 2048, NULL, 2, &h_uart);
-    xTaskCreate(button_task, "button_Task", 2048, NULL, 2, &h_btn);
-    // Inferencia: stack grande (o classificador consome bastante). No core 0,
-    // junto do mpu_task, que dorme durante o modo gesto.
-    xTaskCreate(gesture_task, "gesture_Task", 16384, NULL, 2, &h_gesture);
+    TaskHandle_t h_mpu = NULL;
+    TaskHandle_t h_fusion = NULL;
+    TaskHandle_t h_pwm = NULL;
+    TaskHandle_t h_uart = NULL;
+    TaskHandle_t h_btn = NULL;
+    TaskHandle_t h_ai = NULL;
+    TaskHandle_t h_audio_debug = NULL;
+
+    require_task_created(xTaskCreate(mpu6050_task, "mpu6050_Task", 8192, NULL, 3, &h_mpu));
+    require_task_created(xTaskCreate(fusion_task, "fusion_Task", 8192, NULL, 3, &h_fusion));
+    require_task_created(xTaskCreate(pwm_task, "pwm_Task", 1024, NULL, 1, &h_pwm));
+    require_task_created(xTaskCreate(uart_task, "uart_Task", 2048, NULL, 2, &h_uart));
+    require_task_created(xTaskCreate(button_task, "button_Task", 2048, NULL, 2, &h_btn));
+    require_task_created(xTaskCreate(ai_task, "ai_Task", 16384, NULL, 2, &h_ai));
+    require_task_created(xTaskCreate(audio_debug_task, "audio_debug_Task", 1024, NULL, 1, &h_audio_debug));
 
     vTaskCoreAffinitySet(h_mpu, CORE_0);
     vTaskCoreAffinitySet(h_fusion, CORE_1);
     vTaskCoreAffinitySet(h_pwm, CORE_1);
     vTaskCoreAffinitySet(h_uart, CORE_1);
     vTaskCoreAffinitySet(h_btn, CORE_1);
-    vTaskCoreAffinitySet(h_gesture, CORE_0);
+    vTaskCoreAffinitySet(h_ai, CORE_0);
+    vTaskCoreAffinitySet(h_audio_debug, CORE_1);
 
     vTaskStartScheduler();
     while (true)
