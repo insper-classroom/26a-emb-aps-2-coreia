@@ -32,10 +32,10 @@ const int I2C_SCL_GPIO = 17;
 #define PIN_INSTR_PWM 12
 #define PIN_INSTR_UART 13
 
-#define BTN_ROT_R_PIN 4 // gira direita -> seta cima
-#define BTN_ESC_PIN 5
 #define BTN_PAUSE_PIN 2 // segurado -> pausa o IMU
 #define BTN_ENTER_PIN 3
+#define BTN_ROT_R_PIN 4 // gira direita -> seta cima
+#define BTN_ESC_PIN 5
 #define BTN_DEBOUNCE_US 20000
 
 #define AUDIO_PIN 6
