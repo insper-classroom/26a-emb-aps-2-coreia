@@ -4,7 +4,7 @@ import sys
 import glob
 import time
 import serial
-from pynput.mouse import Controller as MouseCtl, Button
+from pynput.mouse import Controller as MouseCtl
 from pynput.keyboard import Controller as KbCtl, Key
 import tkinter as tk
 from tkinter import ttk
@@ -12,17 +12,52 @@ from tkinter import messagebox
 
 
 # Protocolo binário: [0xFF, axis, value + 128]
-# axis:  0 = X, 1 = Y, 2 = CLICK
+# axis:  0 = X, 1 = Y, 2 = CLICK (ignored by this receiver)
 # value: int em [-95, +95] deslocado para [33, 223]
 SYNC_BYTE    = 0xFF
 VALUE_OFFSET = 128
 AXIS_X       = 0
 AXIS_Y       = 1
-AXIS_CLICK   = 2          # evento de clique enviado pelo firmware
+AXIS_CLICK   = 2          # evento de clique do acelerometro, ignorado
 AXIS_ROT_R   = 3          # botao: girar direita -> seta cima
-AXIS_ROT_L   = 4          # botao: girar esquerda -> Z
-AXIS_SPACE   = 5          # botao: space
+AXIS_SPACE   = 5          # evento enviado apenas pela deteccao da IA
+AXIS_AI_CONFIDENCE = 6    # confianca da classe "tetris", escalada para 0..94
+AXIS_AI_STATUS = 7
+AXIS_AI_PROGRESS = 8
+AXIS_DEBUG_ACCEL_X = 9
+AXIS_DEBUG_ACCEL_Y = 10
+AXIS_DEBUG_ACCEL_Z = 11
+AXIS_AI_IDLE_CONFIDENCE = 12
+AXIS_AI_ANOMALY = 13
+AXIS_AI_DSP_MS = 14
+AXIS_AI_CLASSIFICATION_MS = 15
+AXIS_AI_QUEUE_DEPTH = 16
+AXIS_AI_ERROR_CODE = 17
+AXIS_IMU_READ_ERRORS = 18
+AXIS_ENTER = 19
+AXIS_ESC = 20
+AXIS_AUDIO_STATUS = 21
+AXIS_AUDIO_INDEX_LOW = 22
+AXIS_AUDIO_INDEX_MID = 23
+AXIS_AUDIO_INDEX_HIGH = 24
 MAX_ABS_VALUE = 95
+WAV_DATA_LENGTH = 742926
+AUDIO_SAMPLE_RATE = 11000
+
+AUDIO_STATUS = {
+    1: "started",
+    2: "paused",
+    3: "resumed",
+}
+
+AI_STATUS = {
+    1: "AI task started",
+    2: "pause active; collecting IMU samples",
+    3: "AI window ready; running classifier",
+    4: "classifier error",
+    5: "tetris detected",
+    6: "pause released; AI buffers reset",
+}
 
 # Coloca em True para imprimir cada pacote decodificado no terminal
 DEBUG = True
@@ -30,6 +65,12 @@ DEBUG = True
 
 mouse = MouseCtl()
 kb = KbCtl()
+debug_start = time.monotonic()
+
+
+def debug_print(message):
+    elapsed = time.monotonic() - debug_start
+    print(f"[{elapsed:8.3f}s] {message}", flush=True)
 
 
 def controle(ser):
@@ -38,8 +79,9 @@ def controle(ser):
     Protocolo: 0xFF (sync) + 2 bytes [axis, value+128].
 
     Drena tudo que chegou na serial a cada iteracao e aplica apenas o ULTIMO
-    estado de X/Y (um unico mouse.move por ciclo). Cliques e botoes sao eventos
-    discretos e executam todos. Usa pynput (chamadas em microssegundos) em vez
+    estado de X/Y (um unico mouse.move por ciclo). Botoes sao eventos discretos
+    e executam todos. O clique do acelerometro (axis 2) e ignorado. Usa pynput
+    (chamadas em microssegundos) em vez
     de pyautogui (dezenas de ms por chamada), que nao acompanhava 200 pacotes/s.
 
     O pause do IMU e resolvido inteiro no firmware: enquanto pausado o Pico
@@ -49,6 +91,8 @@ def controle(ser):
     ser.timeout = 0
     buf = bytearray()
     last = {AXIS_X: 0, AXIS_Y: 0}
+    audio_index_parts = [0, 0, 0]
+    previous_audio_index = None
     while True:
         chunk = ser.read(4096)
         if chunk:
@@ -69,23 +113,72 @@ def controle(ser):
             del buf[:3]
 
             if axis == AXIS_CLICK:
-                mouse.click(Button.left)
-                if DEBUG:
-                    print("CLICK!")
+                continue
             elif axis == AXIS_ROT_R:
                 kb.tap(Key.up)
                 if DEBUG:
                     print("ROT R (up)")
-            elif axis == AXIS_ROT_L:
-                kb.tap('z')
-                if DEBUG:
-                    print("ROT L (z)")
             elif axis == AXIS_SPACE:
                 kb.tap(Key.space)
                 if DEBUG:
-                    print("SPACE")
-            elif axis == 6:
-                print(f"pino pause -> {'APERTADO' if value else 'solto'}")
+                    print("SPACE (AI)")
+            elif axis == AXIS_ENTER:
+                kb.tap(Key.enter)
+                if DEBUG:
+                    print("ENTER")
+            elif axis == AXIS_ESC:
+                kb.tap(Key.esc)
+                if DEBUG:
+                    print("ESC")
+            elif axis == AXIS_AUDIO_STATUS:
+                debug_print(f"Audio status: {AUDIO_STATUS.get(value, f'unknown ({value})')}")
+            elif axis == AXIS_AUDIO_INDEX_LOW:
+                audio_index_parts[0] = value
+            elif axis == AXIS_AUDIO_INDEX_MID:
+                audio_index_parts[1] = value
+            elif axis == AXIS_AUDIO_INDEX_HIGH:
+                audio_index_parts[2] = value
+                audio_index = (
+                    audio_index_parts[0]
+                    + audio_index_parts[1] * 95
+                    + audio_index_parts[2] * 95 * 95
+                )
+                delta = (
+                    "first report"
+                    if previous_audio_index is None
+                    else f"delta={audio_index - previous_audio_index:+d}"
+                )
+                debug_print(
+                    f"Audio index: {audio_index}/{WAV_DATA_LENGTH} "
+                    f"({audio_index / AUDIO_SAMPLE_RATE:.2f}s, {delta})"
+                )
+                previous_audio_index = audio_index
+            elif axis == AXIS_AI_CONFIDENCE:
+                debug_print(f"AI tetris confidence: {value * 100 / 94:.1f}%")
+            elif axis == AXIS_AI_STATUS:
+                debug_print(f"AI status: {AI_STATUS.get(value, f'unknown ({value})')}")
+            elif axis == AXIS_AI_PROGRESS:
+                debug_print(f"AI window collection: {value * 100 / 94:.1f}%")
+            elif axis == AXIS_DEBUG_ACCEL_X:
+                debug_print(f"IMU accel X: {value / 20:.2f} g")
+            elif axis == AXIS_DEBUG_ACCEL_Y:
+                debug_print(f"IMU accel Y: {value / 20:.2f} g")
+            elif axis == AXIS_DEBUG_ACCEL_Z:
+                debug_print(f"IMU accel Z: {value / 20:.2f} g")
+            elif axis == AXIS_AI_IDLE_CONFIDENCE:
+                debug_print(f"AI idle confidence: {value * 100 / 94:.1f}%")
+            elif axis == AXIS_AI_ANOMALY:
+                debug_print(f"AI anomaly score: {value / 10:.1f}")
+            elif axis == AXIS_AI_DSP_MS:
+                debug_print(f"AI DSP time: {value} ms")
+            elif axis == AXIS_AI_CLASSIFICATION_MS:
+                debug_print(f"AI classification time: {value} ms")
+            elif axis == AXIS_AI_QUEUE_DEPTH:
+                debug_print(f"AI sample queue depth: {value}")
+            elif axis == AXIS_AI_ERROR_CODE:
+                debug_print(f"AI classifier error code: {value}")
+            elif axis == AXIS_IMU_READ_ERRORS:
+                debug_print(f"IMU read errors: {value}")
             elif axis in (AXIS_X, AXIS_Y) and abs(value) <= MAX_ABS_VALUE:
                 last[axis] = value
                 moved = True
