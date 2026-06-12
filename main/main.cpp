@@ -31,6 +31,9 @@ const int I2C_SCL_GPIO = 17;
 #define PIN_INSTR_FUSION 11
 #define PIN_INSTR_PWM 12
 #define PIN_INSTR_UART 13
+#define PIN_INSTR_BUTTON 18
+#define PIN_INSTR_AI 19
+#define PIN_INSTR_AUDIO_DEBUG 20
 
 #define BTN_PAUSE_PIN 2 // segurado -> pausa o IMU
 #define BTN_ENTER_PIN 3
@@ -104,20 +107,43 @@ typedef struct
 {
     uint8_t r, g, b;
 } color_data_t;
+typedef enum
+{
+    AUDIO_COMMAND_START,
+    AUDIO_COMMAND_TOGGLE_PAUSE,
+    AUDIO_COMMAND_REPORT_INDEX,
+} audio_command_t;
+typedef struct
+{
+    uint8_t status;
+    uint32_t index;
+} audio_event_t;
+typedef struct
+{
+    uint32_t index;
+    bool started;
+    bool paused;
+} audio_state_t;
 
 QueueHandle_t xQueueMPU;
 QueueHandle_t xQueueAI;
 QueueHandle_t xQueuePos;
 QueueHandle_t xQueueColor;
 QueueHandle_t xQueueBtn;
+QueueHandle_t xQueueAudioCommand;
+QueueHandle_t xQueueAudioEvent;
 SemaphoreHandle_t xMutexUart;
 SemaphoreHandle_t xMutexI2C;
 static repeating_timer_t audio_timer;
-static volatile uint32_t audio_index = 0;
-static volatile bool audio_started = false;
-static volatile bool audio_paused = false;
 
 static void send_packet(uint8_t axis, int8_t value);
+
+static void instrumentation_init(uint pin)
+{
+    gpio_init(pin);
+    gpio_set_dir(pin, GPIO_OUT);
+    gpio_put(pin, 0);
+}
 
 static void pwm_init_pin(uint pin)
 {
@@ -157,26 +183,55 @@ static void mpu6050_init()
 
 static bool audio_timer_callback(repeating_timer_t *timer)
 {
-    if (!audio_started || audio_paused)
+    audio_state_t *state = (audio_state_t *)timer->user_data;
+    audio_command_t command;
+    audio_event_t event = {0, 0};
+    BaseType_t higher_priority_task_woken = pdFALSE;
+
+    while (xQueueReceiveFromISR(xQueueAudioCommand, &command, &higher_priority_task_woken) == pdTRUE)
+    {
+        if (command == AUDIO_COMMAND_START && !state->started)
+        {
+            state->started = true;
+            state->paused = false;
+            event.status = AUDIO_STATUS_STARTED;
+            xQueueSendFromISR(xQueueAudioEvent, &event, &higher_priority_task_woken);
+        }
+        else if (command == AUDIO_COMMAND_TOGGLE_PAUSE && state->started)
+        {
+            state->paused = !state->paused;
+            event.status = state->paused ? AUDIO_STATUS_PAUSED : AUDIO_STATUS_RESUMED;
+            xQueueSendFromISR(xQueueAudioEvent, &event, &higher_priority_task_woken);
+        }
+        else if (command == AUDIO_COMMAND_REPORT_INDEX && state->started)
+        {
+            event.index = state->index;
+            xQueueSendFromISR(xQueueAudioEvent, &event, &higher_priority_task_woken);
+        }
+    }
+
+    portYIELD_FROM_ISR(higher_priority_task_woken);
+
+    if (!state->started || state->paused)
     {
         pwm_set_gpio_level(AUDIO_PIN, AUDIO_MIDPOINT);
         return true;
     }
 
     int32_t amplified =
-        AUDIO_MIDPOINT + ((int32_t)WAV_DATA[audio_index] - AUDIO_MIDPOINT) * AUDIO_GAIN;
+        AUDIO_MIDPOINT + ((int32_t)WAV_DATA[state->index] - AUDIO_MIDPOINT) * AUDIO_GAIN;
     if (amplified < 0)
         amplified = 0;
     else if (amplified > 255)
         amplified = 255;
     pwm_set_gpio_level(AUDIO_PIN, (uint16_t)amplified);
-    audio_index++;
-    if (audio_index >= WAV_DATA_LENGTH)
-        audio_index = 0;
+    state->index++;
+    if (state->index >= WAV_DATA_LENGTH)
+        state->index = 0;
     return true;
 }
 
-static void audio_init()
+static void audio_init(audio_state_t *state)
 {
     pwm_init_pin(AUDIO_PIN);
     gpio_set_drive_strength(AUDIO_PIN, GPIO_DRIVE_STRENGTH_2MA);
@@ -185,7 +240,7 @@ static void audio_init()
     bool started = add_repeating_timer_us(
         -((1000000 + (AUDIO_SAMPLE_RATE / 2)) / AUDIO_SAMPLE_RATE),
         audio_timer_callback,
-        NULL,
+        state,
         &audio_timer);
     if (!started)
         panic("Audio timer creation failed");
@@ -193,39 +248,53 @@ static void audio_init()
 
 static void audio_start()
 {
-    if (!audio_started)
-    {
-        audio_started = true;
-        audio_paused = false;
-        send_packet(AXIS_AUDIO_STATUS, AUDIO_STATUS_STARTED);
-    }
+    audio_command_t command = AUDIO_COMMAND_START;
+    xQueueSend(xQueueAudioCommand, &command, 0);
 }
 
 static void audio_toggle_pause()
 {
-    if (audio_started)
-    {
-        audio_paused = !audio_paused;
-        send_packet(
-            AXIS_AUDIO_STATUS,
-            audio_paused ? AUDIO_STATUS_PAUSED : AUDIO_STATUS_RESUMED);
-    }
+    audio_command_t command = AUDIO_COMMAND_TOGGLE_PAUSE;
+    xQueueSend(xQueueAudioCommand, &command, 0);
 }
 
 void audio_debug_task(void *p)
 {
+    instrumentation_init(PIN_INSTR_AUDIO_DEBUG);
+    audio_state_t state = {0, false, false};
+    audio_event_t event;
+    audio_command_t report_command = AUDIO_COMMAND_REPORT_INDEX;
+    TickType_t last_report = xTaskGetTickCount();
+
+    audio_init(&state);
+
     while (1)
     {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        if (!audio_started)
-            continue;
+        if (xQueueReceive(xQueueAudioEvent, &event, pdMS_TO_TICKS(50)) == pdTRUE)
+        {
+            gpio_put(PIN_INSTR_AUDIO_DEBUG, 1);
+            if (event.status != 0)
+            {
+                send_packet(AXIS_AUDIO_STATUS, event.status);
+            }
+            else
+            {
+                // Encode the full sample index as three base-95 digits because each
+                // serial packet can carry only values from 0 through 94.
+                send_packet(AXIS_AUDIO_INDEX_LOW, event.index % 95);
+                send_packet(AXIS_AUDIO_INDEX_MID, (event.index / 95) % 95);
+                send_packet(AXIS_AUDIO_INDEX_HIGH, (event.index / (95 * 95)) % 95);
+            }
+            gpio_put(PIN_INSTR_AUDIO_DEBUG, 0);
+        }
 
-        // Encode the full sample index as three base-95 digits because each
-        // serial packet can carry only values from 0 through 94.
-        const uint32_t index = audio_index;
-        send_packet(AXIS_AUDIO_INDEX_LOW, index % 95);
-        send_packet(AXIS_AUDIO_INDEX_MID, (index / 95) % 95);
-        send_packet(AXIS_AUDIO_INDEX_HIGH, (index / (95 * 95)) % 95);
+        if (xTaskGetTickCount() - last_report >= pdMS_TO_TICKS(1000))
+        {
+            gpio_put(PIN_INSTR_AUDIO_DEBUG, 1);
+            xQueueSend(xQueueAudioCommand, &report_command, 0);
+            last_report = xTaskGetTickCount();
+            gpio_put(PIN_INSTR_AUDIO_DEBUG, 0);
+        }
     }
 }
 
@@ -295,8 +364,7 @@ static void require_task_created(BaseType_t result)
 
 void mpu6050_task(void *p)
 {
-    gpio_init(PIN_INSTR_MPU);
-    gpio_set_dir(PIN_INSTR_MPU, GPIO_OUT);
+    instrumentation_init(PIN_INSTR_MPU);
     mpu6050_init();
     mpu_data_t data;
     int16_t temp;
@@ -341,8 +409,7 @@ void mpu6050_task(void *p)
 
 void fusion_task(void *p)
 {
-    gpio_init(PIN_INSTR_FUSION);
-    gpio_set_dir(PIN_INSTR_FUSION, GPIO_OUT);
+    instrumentation_init(PIN_INSTR_FUSION);
     mpu_data_t raw;
     pos_data_t pos;
     color_data_t color;
@@ -453,8 +520,7 @@ void fusion_task(void *p)
 
 void pwm_task(void *p)
 {
-    gpio_init(PIN_INSTR_PWM);
-    gpio_set_dir(PIN_INSTR_PWM, GPIO_OUT);
+    instrumentation_init(PIN_INSTR_PWM);
     color_data_t color;
     pwm_init_pin(LED_R_PIN);
     pwm_init_pin(LED_G_PIN);
@@ -500,6 +566,7 @@ void btn_callback(uint gpio, uint32_t events)
 
 void button_task(void *p)
 {
+    instrumentation_init(PIN_INSTR_BUTTON);
     const uint pins[] = {BTN_ROT_R_PIN, BTN_ENTER_PIN, BTN_ESC_PIN};
     for (size_t i = 0; i < sizeof(pins) / sizeof(pins[0]); i++)
     {
@@ -519,6 +586,7 @@ void button_task(void *p)
     {
         if (xQueueReceive(xQueueBtn, &pin, portMAX_DELAY) == pdTRUE)
         {
+            gpio_put(PIN_INSTR_BUTTON, 1);
             // Confirma o nivel apos a borda: bounce ao soltar gera borda de
             // descida falsa, mas 5ms depois o pino ja esta alto e descarta.
             vTaskDelay(pdMS_TO_TICKS(5));
@@ -534,12 +602,14 @@ void button_task(void *p)
                                                         : AXIS_ESC;
                 send_packet(axis, 0);
             }
+            gpio_put(PIN_INSTR_BUTTON, 0);
         }
     }
 }
 
 void ai_task(void *p)
 {
+    instrumentation_init(PIN_INSTR_AI);
     mpu_data_t raw;
     static float ring[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];
     static float inference_buffer[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];
@@ -575,6 +645,8 @@ void ai_task(void *p)
         if (xQueueReceive(xQueueAI, &raw, pdMS_TO_TICKS(20)) != pdTRUE)
             continue;
 
+        gpio_put(PIN_INSTR_AI, 1);
+
         // This model was trained with raw MPU6050 accelerometer counts.
         ring[write_index + 0] = raw.accel[0];
         ring[write_index + 1] = raw.accel[1];
@@ -591,7 +663,10 @@ void ai_task(void *p)
 
         if (collected_samples < EI_CLASSIFIER_RAW_SAMPLE_COUNT ||
             samples_since_inference < AI_INFERENCE_STRIDE_SAMPLES)
+        {
+            gpio_put(PIN_INSTR_AI, 0);
             continue;
+        }
 
         samples_since_inference = 0;
         for (int ix = 0; ix < frame_values; ix++)
@@ -600,7 +675,10 @@ void ai_task(void *p)
 
         ei::signal_t signal;
         if (ei::numpy::signal_from_buffer(inference_buffer, frame_values, &signal) != 0)
+        {
+            gpio_put(PIN_INSTR_AI, 0);
             continue;
+        }
 
         ei_impulse_result_t result = {0};
         EI_IMPULSE_ERROR classifier_error = run_classifier(&signal, &result, false);
@@ -608,6 +686,7 @@ void ai_task(void *p)
         {
             send_packet(AXIS_AI_STATUS, AI_STATUS_CLASSIFIER_ERROR);
             send_packet(AXIS_AI_ERROR_CODE, clamp94(classifier_error));
+            gpio_put(PIN_INSTR_AI, 0);
             continue;
         }
 
@@ -636,6 +715,7 @@ void ai_task(void *p)
                 send_packet(AXIS_SPACE, 0);
                 // Drop samples accumulated during the cooldown. Replaying them
                 // quickly would destroy the model's real-time sample spacing.
+                gpio_put(PIN_INSTR_AI, 0);
                 vTaskDelay(pdMS_TO_TICKS(AI_GESTURE_COOLDOWN_MS));
                 xQueueReset(xQueueAI);
                 write_index = 0;
@@ -644,13 +724,13 @@ void ai_task(void *p)
                 break;
             }
         }
+        gpio_put(PIN_INSTR_AI, 0);
     }
 }
 
 void uart_task(void *p)
 {
-    gpio_init(PIN_INSTR_UART);
-    gpio_set_dir(PIN_INSTR_UART, GPIO_OUT);
+    instrumentation_init(PIN_INSTR_UART);
     pos_data_t pos;
     while (1)
     {
@@ -681,13 +761,13 @@ int main()
     gpio_init(BTN_PAUSE_PIN);
     gpio_set_dir(BTN_PAUSE_PIN, GPIO_IN);
     gpio_pull_up(BTN_PAUSE_PIN);
-    audio_init();
-
     xQueueMPU = xQueueCreate(32, sizeof(mpu_data_t));
     xQueueAI = xQueueCreate(128, sizeof(mpu_data_t));
     xQueuePos = xQueueCreate(32, sizeof(pos_data_t));
     xQueueColor = xQueueCreate(32, sizeof(color_data_t));
     xQueueBtn = xQueueCreate(8, sizeof(uint8_t));
+    xQueueAudioCommand = xQueueCreate(8, sizeof(audio_command_t));
+    xQueueAudioEvent = xQueueCreate(8, sizeof(audio_event_t));
     xMutexUart = xSemaphoreCreateMutex();
     xMutexI2C = xSemaphoreCreateMutex();
 
@@ -696,6 +776,8 @@ int main()
     require_handle(xQueuePos);
     require_handle(xQueueColor);
     require_handle(xQueueBtn);
+    require_handle(xQueueAudioCommand);
+    require_handle(xQueueAudioEvent);
     require_handle(xMutexUart);
     require_handle(xMutexI2C);
 
