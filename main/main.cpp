@@ -188,7 +188,7 @@ static bool audio_timer_callback(repeating_timer_t *timer)
     audio_event_t event = {0, 0};
     BaseType_t higher_priority_task_woken = pdFALSE;
 
-    while (xQueueReceiveFromISR(xQueueAudioCommand, &command, &higher_priority_task_woken) == pdTRUE)
+    if (xQueueReceiveFromISR(xQueueAudioCommand, &command, &higher_priority_task_woken) == pdTRUE)
     {
         if (command == AUDIO_COMMAND_START && !state->started)
         {
