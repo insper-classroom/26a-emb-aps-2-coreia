@@ -183,7 +183,7 @@ static void mpu6050_init()
 
 static bool audio_timer_callback(repeating_timer_t *timer)
 {
-    audio_state_t *state = (audio_state_t *)timer->user_data;
+    audio_state_t *state = static_cast<audio_state_t *>(timer->user_data);
     audio_command_t command;
     audio_event_t event = {0, 0};
     BaseType_t higher_priority_task_woken = pdFALSE;
@@ -544,11 +544,11 @@ void pwm_task(void *p)
 // geram releituras do mesmo nivel, sem efeito colateral.
 void btn_callback(uint gpio, uint32_t events)
 {
-    static uint32_t last_us[32];
     uint32_t now = time_us_32();
 
     if (gpio == BTN_ROT_R_PIN || gpio == BTN_ENTER_PIN || gpio == BTN_ESC_PIN)
     {
+        static uint32_t last_us[32];
         if (now - last_us[gpio] < BTN_DEBOUNCE_US)
             return;
         last_us[gpio] = now;
